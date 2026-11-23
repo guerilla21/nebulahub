@@ -1,0 +1,286 @@
+name: Build NEBULA HUB PKG
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang-14 lld-14 llvm-14 \
+            python3 curl unzip git cmake make imagemagick \
+            dotnet-sdk-8.0 perl
+          # Symlink clang-14 as clang/clang++ so scripts find it
+          sudo ln -sf /usr/bin/clang-14   /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-14 /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/ld.lld-14  /usr/local/bin/ld.lld
+
+      # ── Download toolchain tarball (confirmed working URL pattern) ────────
+      - name: Get OpenOrbis PS4 Toolchain
+        run: |
+          # Get latest tag from GitHub API
+          LATEST=$(curl -sL https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
+            | grep '"tag_name"' \
+            | perl -pe 's/.*"([^"]+)".*/\1/' \
+            | tr -d '[:space:]')
+          echo "Latest tag: $LATEST"
+
+          # Download tarball (curl -L follows redirects)
+          curl -L \
+            "https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/${LATEST}/${LATEST}.tar.gz" \
+            -o toolchain.tar.gz
+
+          echo "Downloaded: $(du -sh toolchain.tar.gz)"
+
+          mkdir openorbis
+          tar -xzf toolchain.tar.gz -C openorbis --strip-components=1
+
+          # Mark Linux binaries executable
+          find openorbis/bin/linux -type f -exec chmod +x {} \; 2>/dev/null || true
+
+          echo "OO_PS4_TOOLCHAIN=$(pwd)/openorbis" >> $GITHUB_ENV
+
+          echo "Toolchain structure:"
+          ls openorbis/
+          echo "Toolchain include:"
+          ls openorbis/include/ | head -20
+          echo "Toolchain lib:"
+          ls openorbis/lib/ | head -20
+          echo "Toolchain bin/linux:"
+          ls openorbis/bin/linux/
+
+      # ── Build LibOrbisPkg / PkgTool.Core ──────────────────────────────────
+      - name: Build PkgTool.Core
+        run: |
+          git clone --depth 1 \
+            https://github.com/OpenOrbis/LibOrbisPkg.git pkgtool_src
+          cd pkgtool_src
+          dotnet build PkgTool.Core/PkgTool.Core.csproj \
+            --configuration Release \
+            --output ../pkgtool_bin \
+            -p:TargetFramework=net8.0
+          cd ..
+          PKGTOOL_DLL=$(find pkgtool_bin -name "PkgTool.Core.dll" | head -1)
+          echo "PKGTOOL_DLL=$PKGTOOL_DLL" >> $GITHUB_ENV
+          echo "PkgTool: $PKGTOOL_DLL"
+
+      # ── Fonts ─────────────────────────────────────────────────────────────
+      - name: Get fonts
+        run: |
+          mkdir -p assets/fonts
+          curl -sfL -o assets/fonts/NotoSans-Regular.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Regular.ttf" || true
+          curl -sfL -o assets/fonts/NotoSans-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Bold.ttf" || true
+          [ ! -s assets/fonts/NotoSans-Regular.ttf ] && \
+            cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+               assets/fonts/NotoSans-Regular.ttf || true
+          [ ! -s assets/fonts/NotoSans-Bold.ttf ] && \
+            cp /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf \
+               assets/fonts/NotoSans-Bold.ttf || true
+          ls -lh assets/fonts/
+
+      # ── Icons ─────────────────────────────────────────────────────────────
+      - name: Generate app icons
+        run: |
+          mkdir -p sce_sys
+          convert -size 228x128 gradient:'#0D0D1A-#1A0A30' \
+            -font DejaVu-Sans-Bold -pointsize 18 \
+            -fill '#9B4FFF' -annotate +14+42 'NEBULA HUB' \
+            -fill '#AAAACC' -pointsize 13 \
+            -annotate +14+62 'Avatar & Theme Library' \
+            sce_sys/icon0.png
+          convert -size 1920x1080 gradient:'#07071A-#0A0A20' \
+            -font DejaVu-Sans-Bold -pointsize 96 \
+            -fill '#7B2FFF' -gravity Center -annotate +0-100 'NEBULA HUB' \
+            -font DejaVu-Sans -pointsize 36 \
+            -fill '#6666AA' -gravity Center \
+            -annotate +0+20 'The Ultimate PS4 Customization Library' \
+            sce_sys/pic0.png
+          cp sce_sys/pic0.png sce_sys/bg0.png
+
+      # ── Compile ───────────────────────────────────────────────────────────
+      - name: Compile NEBULA HUB ELF
+        run: |
+          OO="${{ env.OO_PS4_TOOLCHAIN }}"
+
+          # Use toolchain's own clang if present, else system clang-14
+          CLANG="$OO/bin/linux/clang++"
+          [ -f "$CLANG" ] && chmod +x "$CLANG" || CLANG="clang++"
+          LLD="$OO/bin/linux/ld.lld"
+          [ -f "$LLD" ] && chmod +x "$LLD" || LLD="ld.lld-14"
+
+          echo "Compiler: $($CLANG --version | head -1)"
+          echo "Linker: $LLD"
+
+          # ─── CORRECT FLAGS (from al-azif real working PS4 homebrew) ───
+          # -isysroot $OO  = use toolchain as the sysroot (no host glibc)
+          # -isystem $OO/include = toolchain's musl libc + libc++ headers
+          # -Iinclude = our SDL2/orbis stubs (before toolchain headers)
+          CXXFLAGS="\
+            --target=x86_64-pc-freebsd12-elf \
+            -fPIC \
+            -funwind-tables \
+            -std=c++17 \
+            -O2 \
+            -D__ORBIS__ \
+            -isysroot $OO \
+            -isystem $OO/include \
+            -Iinclude \
+            -Isrc"
+
+          echo "=== Stub headers ==="
+          ls include/SDL2/ include/orbis/
+
+          SRCS="\
+            src/main.cpp \
+            src/db/database.cpp \
+            src/net/fetcher.cpp \
+            src/input/controller.cpp \
+            src/install/installer.cpp \
+            src/ui/renderer.cpp \
+            src/ui/screens.cpp"
+
+          OBJS=""
+          for src in $SRCS; do
+            obj="${src%.cpp}.o"
+            mkdir -p "$(dirname $obj)"
+            echo "Compiling $src..."
+            $CLANG $CXXFLAGS -c "$src" -o "$obj"
+            OBJS="$OBJS $obj"
+          done
+
+          echo "=== Linking ==="
+          $LLD -m elf_x86_64 \
+            --script "$OO/link.x" \
+            --eh-frame-hdr \
+            -pie \
+            -z max-page-size=0x4000 \
+            -z relro \
+            -L"$OO/lib" \
+            $OBJS \
+            -lSDL2_stub \
+            -lSDL2_image_stub \
+            -lSDL2_ttf_stub \
+            -lSceNet_stub \
+            -lSceHttp_stub \
+            -lSceSsl_stub \
+            -lScePad_stub \
+            -lSceUserService_stub \
+            -lSceSystemService_stub \
+            -lSceVideoOut_stub \
+            -lScePthread_stub \
+            -lkernel_stub \
+            -lc \
+            -lc++ \
+            -lc++abi \
+            -o eboot.elf
+
+          echo "ELF: $(ls -lh eboot.elf)"
+
+      # ── FSELF ─────────────────────────────────────────────────────────────
+      - name: Create FSELF
+        run: |
+          OO="${{ env.OO_PS4_TOOLCHAIN }}"
+          FSELF=""
+          for n in create-fself create_fself; do
+            [ -f "$OO/bin/linux/$n" ] && FSELF="$OO/bin/linux/$n" && break
+          done
+          if [ -z "$FSELF" ]; then
+            echo "create-fself not in toolchain, cloning..."
+            git clone --depth 1 https://github.com/OpenOrbis/create-fself fself_src
+            cd fself_src && go build -o ../create-fself ./cmd/create-fself/ 2>/dev/null \
+              || echo "go build failed" && cd ..
+            [ -f create-fself ] && FSELF="$(pwd)/create-fself"
+          fi
+          if [ -z "$FSELF" ]; then
+            echo "ERROR: create-fself not found"
+            exit 1
+          fi
+          chmod +x "$FSELF"
+          "$FSELF" \
+            -in eboot.elf \
+            -out eboot.bin \
+            --paid 0x3800000000000011 \
+            --npdrmtype fake \
+            --app \
+            --authinfo 0100000000000000F0000000FFD40000000000000000000000000000000000000000000000000000000800000000000000380000000000008000003800000000000000000000008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+          ls -lh eboot.bin
+
+      # ── param.sfo ─────────────────────────────────────────────────────────
+      - name: Build param.sfo
+        run: |
+          OO="${{ env.OO_PS4_TOOLCHAIN }}"
+          SFOTOOL=""
+          for n in sfo_tool sfo-tool; do
+            [ -f "$OO/bin/linux/$n" ] && SFOTOOL="$OO/bin/linux/$n" && break
+          done
+          if [ -n "$SFOTOOL" ]; then
+            chmod +x "$SFOTOOL"
+            "$SFOTOOL" --create \
+              --title "NEBULA HUB" \
+              --title-id "NEBU00001" \
+              --app-ver "01.00" \
+              sce_sys/param.sfo
+          else
+            dotnet "${{ env.PKGTOOL_DLL }}" sfo_new \
+              --title "NEBULA HUB" \
+              --title-id "NEBU00001" \
+              --app-ver "01.00" \
+              --sdk-ver "5050001" \
+              --category "gd" \
+              sce_sys/param.sfo
+          fi
+          ls -lh sce_sys/param.sfo
+
+      # ── Build PKG ─────────────────────────────────────────────────────────
+      - name: Build PKG
+        run: |
+          OO="${{ env.OO_PS4_TOOLCHAIN }}"
+          GP4=""
+          for n in create-gp4 create_gp4; do
+            [ -f "$OO/bin/linux/$n" ] && GP4="$OO/bin/linux/$n" && break
+          done
+          if [ -z "$GP4" ]; then
+            echo "create-gp4 not found, cloning..."
+            git clone --depth 1 https://github.com/OpenOrbis/create-gp4 gp4_src
+            cd gp4_src && go build -o ../create-gp4 . 2>/dev/null && cd ..
+            [ -f create-gp4 ] && GP4="$(pwd)/create-gp4"
+          fi
+          if [ -z "$GP4" ]; then
+            echo "ERROR: create-gp4 not found"
+            exit 1
+          fi
+          chmod +x "$GP4"
+          "$GP4" \
+            -out project.gp4 \
+            --content-id "NEBU00001-NEBU00001_00-NEBULAHUB0000001" \
+            --app-path . \
+            --title-id "NEBU00001" \
+            --version "01.00"
+
+          dotnet "${{ env.PKGTOOL_DLL }}" pkg_build project.gp4 . nebulahub.pkg
+
+          echo "=============================="
+          echo "  PKG BUILT SUCCESSFULLY"
+          echo "=============================="
+          ls -lh nebulahub.pkg
+
+      # ── Upload ────────────────────────────────────────────────────────────
+      - name: Upload PKG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nebulahub-pkg
+          path: nebulahub.pkg
+          retention-days: 90
